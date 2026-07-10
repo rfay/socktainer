@@ -96,10 +96,14 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "SHM size can not be less than 0")
             }
 
+            let privileged = body.HostConfig?.Privileged ?? false
+            if privileged {
+                req.logger.notice("privileged: true — Apple Container has no privileged mode; granting all capabilities (capAdd ALL) as the closest equivalent")
+            }
             let normalizedCapabilities: (capAdd: [String], capDrop: [String])
             do {
                 normalizedCapabilities = try Parser.capabilities(
-                    capAdd: body.HostConfig?.CapAdd ?? [],
+                    capAdd: ContainerCreateRoute.effectiveCapAdd(privileged: privileged, capAdd: body.HostConfig?.CapAdd ?? []),
                     capDrop: body.HostConfig?.CapDrop ?? [])
             } catch {
                 throw Abort(.badRequest, reason: "invalid capability: \(error)")
@@ -715,6 +719,17 @@ extension ContainerCreateRoute {
             return .raw(userString: imageUser)
         }
         return .id(uid: 0, gid: 0)
+    }
+
+    /// Docker's --privileged grants every capability (plus device access and disabled
+    /// seccomp/AppArmor, which Apple Container cannot replicate). Approximate it the
+    /// same way apple/container's own builder bootstrap does: capAdd ALL. Explicit
+    /// CapDrop entries are still applied afterwards, so privileged + cap-drop keeps
+    /// the drop — the conservative reading of an ambiguous combination.
+    static func effectiveCapAdd(privileged: Bool, capAdd: [String]) -> [String] {
+        guard privileged else { return capAdd }
+        if capAdd.contains(where: { $0.uppercased() == "ALL" }) { return capAdd }
+        return capAdd + ["ALL"]
     }
 
     /// Mirrors moby's ShmSize handling: a positive request is used verbatim; 0 or omitted

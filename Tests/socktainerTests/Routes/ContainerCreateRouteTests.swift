@@ -289,6 +289,32 @@ struct ShmSizeBytesTests {
     }
 }
 
+@Suite("ContainerCreateRoute.effectiveCapAdd")
+struct EffectiveCapAddTests {
+
+    @Test("Privileged grants all capabilities — the buildx docker-container driver's builder relies on this")
+    func privilegedGrantsAll() {
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: true, capAdd: []) == ["ALL"])
+    }
+
+    @Test("Privileged appends ALL after explicitly requested capabilities")
+    func privilegedAppendsToExplicitCaps() {
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: true, capAdd: ["NET_ADMIN"]) == ["NET_ADMIN", "ALL"])
+    }
+
+    @Test("Privileged does not duplicate an existing ALL, regardless of case")
+    func privilegedDoesNotDuplicateAll() {
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: true, capAdd: ["ALL"]) == ["ALL"])
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: true, capAdd: ["all"]) == ["all"])
+    }
+
+    @Test("Non-privileged requests pass through unchanged")
+    func nonPrivilegedPassthrough() {
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: false, capAdd: []) == [])
+        #expect(ContainerCreateRoute.effectiveCapAdd(privileged: false, capAdd: ["SYS_ADMIN"]) == ["SYS_ADMIN"])
+    }
+}
+
 @Suite("ContainerCreateRoute.resolveUser")
 struct ResolveUserTests {
 
