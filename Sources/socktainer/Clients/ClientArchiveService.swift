@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerRuntimeClient
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -116,10 +117,39 @@ struct ClientArchiveService: ClientArchiveProtocol {
             .appendingPathComponent("rootfs.ext4")
     }
 
+    /// A created-but-never-started container has no rootfs.ext4 yet: Apple Container
+    /// materializes the bundle (cloning the rootfs from the image's shared snapshot)
+    /// lazily in RuntimeService.bootstrap on first start, not at create time. Docker
+    /// materializes the writable layer at create, and clients rely on that — buildx's
+    /// docker-container driver does `create` + `PUT /archive` (seeding /etc with
+    /// certs/config) before ever starting its builder. Create the bundle here exactly
+    /// as bootstrap would, from the runtime configuration written at create time;
+    /// bootstrap skips bundle creation when one already exists, so injected files
+    /// survive the later start.
+    func materializeRootfsIfNeeded(containerId: String) throws {
+        let rootfsPath = getRootfsPath(containerId: containerId)
+        guard !FileManager.default.fileExists(atPath: rootfsPath.path) else { return }
+
+        let containerRoot = rootfsPath.deletingLastPathComponent()
+        let runtimeConfig = try RuntimeConfiguration.readRuntimeConfiguration(from: containerRoot)
+        _ = try ContainerResource.Bundle.create(
+            path: runtimeConfig.path,
+            initialFilesystem: runtimeConfig.initialFilesystem,
+            kernel: runtimeConfig.kernel,
+            containerConfiguration: runtimeConfig.containerConfiguration,
+            containerRootFilesystem: runtimeConfig.containerRootFilesystem,
+            options: runtimeConfig.options
+        )
+    }
+
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
         let rootfsPath = getRootfsPath(containerId: containerId)
+
+        // Best-effort: a failure here (e.g. missing runtime configuration) falls
+        // through to the guard below, which reports the canonical 404.
+        try? materializeRootfsIfNeeded(containerId: containerId)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
@@ -142,7 +172,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let pathStat = PathStat(
             name: (normalizedPath as NSString).lastPathComponent,
             size: inode.size,
-            mode: UInt32(inode.mode),
+            mode: Self.goFileMode(fromExt4Mode: inode.mode),
             mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
             linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
         )
@@ -192,6 +222,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
 
         let rootfsPath = getRootfsPath(containerId: container.id)
+
+        // Best-effort: a failure here (e.g. missing runtime configuration) falls
+        // through to the guard below, which reports the canonical 404.
+        try? materializeRootfsIfNeeded(containerId: container.id)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: container.id)
@@ -553,6 +587,29 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
+    /// Convert an ext4 inode mode to Go's os.FileMode encoding, which is what
+    /// Docker clients expect in X-Docker-Container-Path-Stat. The CLI decides
+    /// file-vs-directory copy semantics from ModeDir (bit 31): raw POSIX
+    /// S_IFDIR (0x4000) reads as a regular file there, making `docker cp` of a
+    /// file into a directory rename the entry to the directory's basename and
+    /// fail with "refusing to overwrite directory".
+    static func goFileMode(fromExt4Mode mode: UInt16) -> UInt32 {
+        var goMode = UInt32(mode) & 0o777
+        switch mode & 0xF000 {
+        case 0x4000: goMode |= 1 << 31  // ModeDir
+        case 0xA000: goMode |= 1 << 27  // ModeSymlink
+        case 0x1000: goMode |= 1 << 25  // ModeNamedPipe
+        case 0xC000: goMode |= 1 << 24  // ModeSocket
+        case 0x2000: goMode |= (1 << 26) | (1 << 21)  // ModeDevice | ModeCharDevice
+        case 0x6000: goMode |= 1 << 26  // ModeDevice
+        default: break  // 0x8000 — regular file
+        }
+        if mode & 0o4000 != 0 { goMode |= 1 << 23 }  // ModeSetuid
+        if mode & 0o2000 != 0 { goMode |= 1 << 22 }  // ModeSetgid
+        if mode & 0o1000 != 0 { goMode |= 1 << 20 }  // ModeSticky
+        return goMode
+    }
+
     /// Read symlink target using the reader's public API
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
         guard let data = try? reader.readFile(at: FilePath(path), followSymlinks: false) else {
@@ -596,7 +653,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Extract a path from the ext4 filesystem to a local directory
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
-        let (_, inode) = try reader.stat(FilePath(sourcePath))
+        // Never follow symlinks here: they are archived as symlinks (tar
+        // semantics, handled below), and following would make any dangling
+        // link — e.g. alpine's /etc/mtab → /proc/mounts, which resolves to
+        // nothing when the container isn't running — abort the whole archive.
+        let (_, inode) = try reader.stat(FilePath(sourcePath), followSymlinks: false)
         let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
