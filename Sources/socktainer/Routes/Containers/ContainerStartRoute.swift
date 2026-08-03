@@ -419,20 +419,25 @@ extension ContainerStartRoute {
             let snapshot = startedSnapshot,
             !ClientContainerService.isDNSSidecar(snapshot)
         {
-            // Register only on a network that has a DNS forwarder sidecar — same reserved set
-            // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
-            // forwarder so any registration would be unreachable; skip entirely if none of the
-            // container's attachments qualify, rather than falling back to the first attachment.
-            if let ip = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
+            // Register on every network that has a DNS forwarder sidecar — same reserved
+            // set as sidecarNetwork. On reserved networks (default/bridge/host/none) there
+            // is no forwarder so any registration would be unreachable; skip entirely if
+            // none of the container's attachments qualify. A multi-homed container (attached
+            // to more than one such network) gets one registration per network — as CIDR
+            // strings so SocktainerDNSServer knows each address's subnet and can hand back
+            // the address that matches whichever network a query actually arrived on,
+            // instead of always the first attachment's address (issue #7).
+            let cidrs = ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot)
+            if !cidrs.isEmpty {
                 if !snapshot.id.isEmpty {
-                    dnsServer.register(hostname: snapshot.id, ip: ip)
-                    logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                    for cidr in cidrs { dnsServer.register(hostname: snapshot.id, ip: cidr) }
+                    logger.info("[dns] registered container name '\(snapshot.id)' → \(cidrs)")
                 }
 
                 // Names stored at create time (Compose service aliases via socktainer.dns.names)
                 if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
                     for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.register(hostname: name, ip: ip)
+                        for cidr in cidrs { dnsServer.register(hostname: name, ip: cidr) }
                     }
                 }
 
@@ -445,14 +450,14 @@ extension ContainerStartRoute {
                 if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
                     !serviceName.isEmpty
                 {
-                    dnsServer.register(hostname: serviceName, ip: ip)
+                    for cidr in cidrs { dnsServer.register(hostname: serviceName, ip: cidr) }
                     if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
                         !projectName.isEmpty
                     {
-                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
-                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
+                        for cidr in cidrs { dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: cidr) }
+                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(cidrs)")
                     } else {
-                        logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
+                        logger.info("[dns] registered compose alias '\(serviceName)' → \(cidrs)")
                     }
                 }
             }
@@ -499,36 +504,53 @@ extension ContainerStartRoute {
     }
 
     /// The IP DNS aliases are registered under — the first non-reserved network
-    /// attachment. Every cache/cleanup site (ContainerInfoCache.ip, ContainerDeleteRoute)
-    /// must derive its IP the same way, or unregisterIfOwned's ownership check silently
-    /// fails to match on multi-network containers.
+    /// attachment. Used only where a single representative address is needed (the DNS
+    /// ownership cache and cleanup paths key on one address per container); DNS
+    /// registration itself uses `dnsAttachmentCIDRs`, which covers every attachment.
     static func dnsAttachmentIP(in snapshot: ContainerSnapshot?) -> String? {
         let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
         return snapshot?.networks.first { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }?
             .ipv4Address.address.description
     }
 
+    /// The CIDR ("address/prefix", e.g. "192.168.1.5/24") for every non-reserved network
+    /// attachment — one per network the container is actually on. Passing the prefix
+    /// length (rather than just the bare address, as `dnsAttachmentIP` does) lets
+    /// SocktainerDNSServer work out which network each address belongs to, so a
+    /// multi-homed container's peers each resolve it to the address reachable on their
+    /// own network (issue #7) instead of whichever attachment happened to be first.
+    static func dnsAttachmentCIDRs(in snapshot: ContainerSnapshot?) -> [String] {
+        let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
+        guard let networks = snapshot?.networks else { return [] }
+        return
+            networks
+            .filter { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }
+            .map { $0.ipv4Address.description }
+    }
+
     /// Re-registers a resumed container's DNS aliases (name, `socktainer.dns.names`,
     /// Compose service/project) — called once per still-running container when
     /// Socktainer starts, since SocktainerDNSServer's registry is in-memory and lost
-    /// across daemon restarts. Uses dnsAttachmentIP so a container whose first network
+    /// across daemon restarts. Uses dnsAttachmentCIDRs so every qualifying network
+    /// attachment (not just the first) is re-registered, and a container whose first
     /// attachment happens to be reserved (e.g. bridge) still gets re-registered on its
-    /// named network, instead of being skipped entirely.
+    /// named network(s) instead of being skipped entirely.
     static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) {
-        guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
+        let cidrs = ContainerStartRoute.dnsAttachmentCIDRs(in: container)
+        guard !cidrs.isEmpty else { return }
 
-        dnsServer.register(hostname: container.id, ip: ip)
+        for cidr in cidrs { dnsServer.register(hostname: container.id, ip: cidr) }
         if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                dnsServer.register(hostname: name, ip: ip)
+                for cidr in cidrs { dnsServer.register(hostname: name, ip: cidr) }
             }
         }
         if let serviceName = container.configuration.labels["com.docker.compose.service"], !serviceName.isEmpty {
-            dnsServer.register(hostname: serviceName, ip: ip)
+            for cidr in cidrs { dnsServer.register(hostname: serviceName, ip: cidr) }
             if let projectName = container.configuration.labels["com.docker.compose.project"], !projectName.isEmpty {
-                dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                for cidr in cidrs { dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: cidr) }
             }
         }
-        logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
+        logger.info("[dns] re-registered '\(container.id)' → \(cidrs) on resume")
     }
 }
