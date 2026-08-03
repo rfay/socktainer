@@ -117,6 +117,131 @@ struct HealthCheckManagerTests {
         await mgr.stop(containerId: "c1")
     }
 
+    // MARK: - Regression: status must not regress from healthy (issue #12)
+
+    @Test("A single transient failure below Retries does not regress healthy to starting")
+    func healthyDoesNotRegressToStartingOnTransientFailure() async throws {
+        actor CallCounter {
+            var count = 0
+            func next() -> Int {
+                count += 1
+                return count
+            }
+        }
+        let counter = CallCounter()
+        let mgr = HealthCheckManager(
+            // Call 1 succeeds (-> healthy). Call 2 fails once (a transient blip,
+            // well below Retries). Call 3+ stall so status stops changing while
+            // the test inspects it right after the transient failure lands.
+            probe: { _, _, _ in
+                let n = await counter.next()
+                if n == 1 { return 0 }
+                if n == 2 { return 1 }
+                try? await Task.sleep(nanoseconds: 3_600_000_000_000)
+                return 0
+            },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 5_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")  // call #1
+        try await Self.waitForFailingStreak(1, on: mgr, id: "c1")  // call #2 (the transient failure)
+        let h = await mgr.currentHealth(for: "c1")
+        // Before the fix, any failure below Retries unconditionally set "starting",
+        // even for a container that had already reported healthy.
+        #expect(h?.Status == "healthy")
+        #expect(h?.FailingStreak == 1)
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("Repeated transient failures never below Retries keep status healthy, not starting")
+    func healthyStaysHealthyAcrossManyTransientFailures() async throws {
+        actor CallCounter {
+            var count = 0
+            func next() -> Int {
+                count += 1
+                return count
+            }
+        }
+        let counter = CallCounter()
+        let mgr = HealthCheckManager(
+            // Alternate success/failure forever. FailingStreak resets to 0 on every
+            // success, so it can never reach Retries — status must stay "healthy".
+            probe: { _, _, _ in
+                let n = await counter.next()
+                return n % 2 == 0 ? 1 : 0
+            },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 2_000_000, Timeout: 1_000_000_000, Retries: 5, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        // Run through many probe cycles (well past the original 5-entry log ring
+        // buffer) to confirm status remains stable over time, not just at the
+        // moment of the first success.
+        for _ in 0..<50 {
+            try await Task.sleep(nanoseconds: 3_000_000)
+            let status = await mgr.currentHealth(for: "c1")?.Status
+            #expect(status == "healthy" || status == nil)
+        }
+        await mgr.stop(containerId: "c1")
+    }
+
+    // MARK: - Regression: the loop must not freeze past Timeout (issue #12)
+
+    @Test("Long start_period/timeout with a short interval still reaches healthy (repro ratio, scaled down)")
+    func longStartPeriodShortIntervalStillReachesHealthy() async throws {
+        // Mirrors the reported repro's ratio (interval=1s, timeout=70s,
+        // start_period=120s) scaled down ~170x so the test runs in well under
+        // a second while exercising the same relative magnitudes: interval
+        // (small) << timeout < start_period.
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 6_000_000, Timeout: 400_000_000, Retries: 3, StartPeriod: 700_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        let h = await mgr.currentHealth(for: "c1")
+        #expect(h?.Status == "healthy")
+        #expect((h?.Log.count ?? 0) > 0)
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("A probe that stalls indefinitely does not freeze the loop past its Timeout")
+    func stalledProbeDoesNotFreezeLoop() async throws {
+        let mgr = HealthCheckManager(
+            // Simulates a probe whose underlying exec call never returns — e.g. a
+            // stalled container lookup / createProcess / start, the part of a real
+            // probe that isn't covered by its own internal wait()-only timeout
+            // race. Without the manager bounding runCheck itself, the loop (and
+            // therefore `.State.Health`) would freeze forever, exactly reproducing
+            // "Status stays starting, Log stays empty indefinitely" from #12.
+            probe: { _, _, _ in
+                try? await Task.sleep(nanoseconds: 3_600_000_000_000)
+                return 0
+            },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 10_000_000, Timeout: 50_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+
+        // Poll for up to ~1s (20x the 50ms Timeout) for a log entry to appear.
+        // Pre-fix, runCheck blocks on the stalled probe forever and this loop
+        // would exhaust its budget with an empty log every time.
+        var logCount = 0
+        for _ in 0..<200 {
+            logCount = await mgr.currentHealth(for: "c1")?.Log.count ?? 0
+            if logCount > 0 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let h = await mgr.currentHealth(for: "c1")
+        #expect(logCount > 0)
+        #expect(h?.Status != "healthy")  // the probe never actually succeeded
+        #expect((h?.FailingStreak ?? 0) > 0)
+        await mgr.stop(containerId: "c1")
+    }
+
     // MARK: - Health log entries
 
     @Test("Log entries are recorded after each probe")
@@ -243,6 +368,21 @@ struct HealthCheckManagerTests {
         }
         let actual = await mgr.currentHealth(for: id)?.Status
         Issue.record("waitForStatus timed out: expected '\(expected)' but got '\(actual ?? "nil")' for container '\(id)'")
+        struct TimeoutError: Error {}
+        throw TimeoutError()
+    }
+
+    /// Polls every 5ms up to ~3s for the manager to report `expected` FailingStreak.
+    /// Fails the test if it's never reached.
+    private static func waitForFailingStreak(_ expected: Int, on mgr: HealthCheckManager, id: String) async throws {
+        for _ in 0..<600 {
+            if await mgr.currentHealth(for: id)?.FailingStreak == expected {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let actual = await mgr.currentHealth(for: id)?.FailingStreak
+        Issue.record("waitForFailingStreak timed out: expected \(expected) but got \(actual.map(String.init) ?? "nil") for container '\(id)'")
         struct TimeoutError: Error {}
         throw TimeoutError()
     }
