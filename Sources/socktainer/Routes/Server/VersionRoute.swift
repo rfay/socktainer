@@ -12,10 +12,12 @@ struct VersionRoute: RouteCollection {
                 // NOTE: For the time being, we will report socktainer's version as a component
                 //       https://github.com/socktainer/socktainer/pull/28#issuecomment-3318209340
                 Components: [Component(Name: "socktainer", Version: getBuildVersion())],
-                // NOTE: Some libraries may require a higher SemVer version compared to Socktainer's actual version
-                //       https://github.com/testcontainers/testcontainers-java/blob/51219646dca72ad267e575bf25d0b60208c60b42/core/src/main/java/org/testcontainers/DockerClientFactory.java#L272
-                //       As a workaround, set the version as the highest supported Docker Engine API version
-                Version: getDockerEngineApiMaxVersion(),
+                // NOTE: `Version` is the engine/product version, distinct from `ApiVersion`.
+                //       Reporting the Docker Engine API version here (e.g. "v1.51") instead of
+                //       socktainer's own product version confused clients that version-gate on
+                //       the engine version (e.g. update nags), since 1.51 sorts far below any
+                //       real minimum-engine-version threshold. https://github.com/rfay/socktainer/issues/13
+                Version: getBuildVersion(),
                 ApiVersion: getDockerEngineApiMaxVersion(),
                 MinAPIVersion: getDockerEngineApiMinVersion(),
                 GitCommit: getBuildGitCommit(),
