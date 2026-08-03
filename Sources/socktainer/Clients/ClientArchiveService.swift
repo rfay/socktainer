@@ -1,5 +1,7 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerRuntimeClient
+import Containerization
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -120,9 +122,78 @@ struct ClientArchiveService: ClientArchiveProtocol {
             .appendingPathComponent("rootfs.ext4")
     }
 
+    /// Materialize a created-but-never-started container's writable rootfs on disk.
+    ///
+    /// Apple's Containerization runtime only clones a container's per-container
+    /// `rootfs.ext4` from its image snapshot the first time the container is
+    /// bootstrapped (`RuntimeService.bootstrap` → the private `createBundle()`,
+    /// in the `container` package's RuntimeLinux server). Before that first boot,
+    /// a container's bundle directory holds only `runtime-configuration.json` —
+    /// no `rootfs.ext4` yet — so any rootfs-path lookup 404s even though the
+    /// container legitimately exists (issue #10: `docker cp` into a container
+    /// between `create` and the first `start` must work, since e.g. buildx's
+    /// buildkit bootstrap relies on it, and real dockerd allows it).
+    ///
+    /// `createBundle()` is private and only reachable through the `bootstrap`
+    /// XPC call, which also boots a whole VM — far too heavy, and semantically
+    /// wrong, just to serve an archive request (it would leave the runtime
+    /// service in a `.booted` state despite the container never truly starting).
+    /// Instead this reproduces the same, purely local, clonefile-based bundle
+    /// materialization step directly, using the same public
+    /// `RuntimeConfiguration` / `ContainerResource.Bundle` APIs the real
+    /// runtime uses internally — without booting anything and without
+    /// touching `ContainerSnapshot.status`. Once materialized, the bundle is
+    /// indistinguishable on disk from one created by a genuine first start, so
+    /// a later `docker start` finds the bundle already present and reuses it
+    /// (and any files written into it via archive) rather than re-cloning it.
+    func ensureRootfsMaterialized(containerId: String) throws {
+        let rootfsPath = getRootfsPath(containerId: containerId)
+        guard !FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            // Already materialized — the common case for any container that has
+            // been started at least once (running or since stopped).
+            return
+        }
+
+        let containerDir =
+            appSupportPath
+            .appendingPathComponent("containers")
+            .appendingPathComponent(containerId)
+
+        let runtimeConfig: RuntimeConfiguration
+        do {
+            runtimeConfig = try RuntimeConfiguration.readRuntimeConfiguration(from: containerDir)
+        } catch {
+            // No rootfs and no pending runtime configuration to materialize one
+            // from: there is genuinely nothing to serve for this container.
+            throw ClientArchiveError.rootfsNotFound(id: containerId)
+        }
+
+        do {
+            _ = try ContainerResource.Bundle.create(
+                path: containerDir,
+                initialFilesystem: runtimeConfig.initialFilesystem,
+                kernel: runtimeConfig.kernel,
+                containerConfiguration: runtimeConfig.containerConfiguration,
+                containerRootFilesystem: runtimeConfig.containerRootFilesystem,
+                options: runtimeConfig.options
+            )
+        } catch {
+            // A concurrent archive call — or a genuine `docker start` racing
+            // this one — may have materialized the bundle first: Bundle.create
+            // clones the rootfs via clonefile, which fails if the destination
+            // already exists. Treat that outcome as success; anything else is
+            // a real failure to prepare the filesystem.
+            guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+                throw ClientArchiveError.operationFailed(
+                    message: "failed to prepare filesystem for \(containerId): \(error)")
+            }
+        }
+    }
+
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        try ensureRootfsMaterialized(containerId: containerId)
         let rootfsPath = getRootfsPath(containerId: containerId)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
@@ -219,6 +290,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             return
         }
 
+        try ensureRootfsMaterialized(containerId: container.id)
         let rootfsPath = getRootfsPath(containerId: container.id)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
