@@ -145,7 +145,15 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                result = result.filter { values.contains($0.id) }
+                // Docker's name filter is a substring match against the
+                // container's name (moby compares against Names with the
+                // leading "/" stripped), and multiple values are OR'd
+                // together. The previous implementation required an exact
+                // match, so anything but the full native id silently
+                // matched nothing.
+                result = result.filter { container in
+                    values.contains { container.id.contains($0) }
+                }
             case "id":
                 result = result.filter { container in
                     values.contains { value in
