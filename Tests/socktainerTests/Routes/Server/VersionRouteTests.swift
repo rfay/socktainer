@@ -61,8 +61,20 @@ struct VersionRouteTests {
             try await app.testing().test(.GET, "/version") { res async throws in
                 let body = try? JSONDecoder().decode(VersionResponseBody.self, from: res.body)
                 let unwrapped = try #require(body)
-                #expect(unwrapped.ApiVersion == getDockerEngineApiMaxVersion())
-                #expect(unwrapped.MinAPIVersion == getDockerEngineApiMinVersion())
+                #expect(unwrapped.ApiVersion == getDockerEngineApiMaxVersion().dropFirst())
+                #expect(unwrapped.MinAPIVersion == getDockerEngineApiMinVersion().dropFirst())
+            }
+        }
+    }
+
+    @Test("ApiVersion and MinAPIVersion are bare digits, not \"v\"-prefixed")
+    func apiVersionFieldsHaveNoVPrefix() async throws {
+        try await withRoute { app in
+            try await app.testing().test(.GET, "/version") { res async throws in
+                let body = try? JSONDecoder().decode(VersionResponseBody.self, from: res.body)
+                let unwrapped = try #require(body)
+                #expect(!unwrapped.ApiVersion.hasPrefix("v"))
+                #expect(!unwrapped.MinAPIVersion.hasPrefix("v"))
             }
         }
     }
