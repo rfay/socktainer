@@ -208,6 +208,47 @@ struct HealthCheckManagerTests {
         await mgr.stop(containerId: "c1")
     }
 
+    // MARK: - Regression: start_period must be probed, not slept through
+
+    @Test("A successful probe during start_period reports healthy immediately, not after start_period elapses")
+    func successDuringStartPeriodReportsHealthyImmediately() async throws {
+        // Docker probes from container start and only declines to count failures
+        // during start_period — a success reports healthy right away. Sleeping
+        // the whole period out before the first probe (the bug) would make this
+        // container report healthy only after ~2s; asserting it happens well
+        // before that proves the probe ran during the period, not after it.
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000
+        )
+        let start = Date()
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 5_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: 2_000_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        #expect(Date().timeIntervalSince(start) < 1.0, "healthy must be reported well before the 2s start_period elapses")
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("A failing probe during start_period does not count toward FailingStreak")
+    func failureDuringStartPeriodDoesNotCountTowardFailingStreak() async throws {
+        // A container that is merely still booting must not burn through Retries
+        // before it gets a chance to succeed. With Retries: 1, a single counted
+        // failure would flip status to "unhealthy" — assert it stays "starting"
+        // through several failed probes inside a start_period long enough to
+        // contain them all.
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 1 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "false"], Interval: 5_000_000, Timeout: 1_000_000_000, Retries: 1, StartPeriod: 200_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Task.sleep(nanoseconds: 150_000_000)  // several probe intervals, still inside start_period
+        let h = await mgr.currentHealth(for: "c1")
+        #expect(h?.Status == "starting")
+        #expect(h?.FailingStreak == 0)
+        await mgr.stop(containerId: "c1")
+    }
+
     @Test("A probe that stalls indefinitely does not freeze the loop past its Timeout")
     func stalledProbeDoesNotFreezeLoop() async throws {
         let mgr = HealthCheckManager(

@@ -143,9 +143,13 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
-        if startPeriodNs > 0 {
-            try? await Task.sleep(nanoseconds: startPeriodNs)
-        }
+        // start_period suppresses *failures*, not probes: Docker probes from the
+        // start and a success during the period marks the container healthy
+        // immediately. Sleeping the period out instead delays the first probe past
+        // it, which breaks any client whose readiness budget is the same value it
+        // passed as start_period — DDEV sets both from default_container_timeout,
+        // so health always landed a moment after DDEV had given up waiting.
+        let startPeriodEnd = Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000)
 
         var failingStreak = 0
 
@@ -157,6 +161,24 @@ actor HealthCheckManager {
             let end = Date()
 
             guard !Task.isCancelled else { return }
+
+            // A failure inside start_period is not yet a failure: leave the streak
+            // alone and stay "starting" so retries aren't consumed by a container
+            // that is simply still booting.
+            if exitCode != 0 && end < startPeriodEnd {
+                updateStatus(
+                    id: containerId,
+                    health: ContainerHealth(Status: "starting", FailingStreak: failingStreak, Log: []),
+                    logEntry: HealthLogEntry(
+                        Start: Self.formatISO8601(start),
+                        End: Self.formatISO8601(end),
+                        ExitCode: exitCode,
+                        Output: ""
+                    )
+                )
+                try? await Task.sleep(nanoseconds: intervalNs)
+                continue
+            }
 
             let entry = HealthLogEntry(
                 Start: Self.formatISO8601(start),
