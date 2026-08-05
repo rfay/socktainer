@@ -98,7 +98,7 @@ struct HostConfig: Content {
     let ConsoleSize: [Int]?
     let CgroupnsMode: String?
 
-    public init(restartPolicy: RestartPolicy? = nil) {
+    public init(restartPolicy: RestartPolicy? = nil, portBindings: [String: [PortBinding]]? = nil) {
         self.Binds = nil
         self.BlkioWeight = nil
         self.BlkioWeightDevice = nil
@@ -141,7 +141,7 @@ struct HostConfig: Content {
         self.Init = nil
         self.AutoRemove = nil
         self.OomScoreAdj = nil
-        self.PortBindings = nil
+        self.PortBindings = portBindings
         self.Privileged = nil
         self.PublishAllPorts = nil
         self.ReadonlyRootfs = nil
