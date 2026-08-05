@@ -423,11 +423,60 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return plan
     }
 
+    /// Upper bound on how long the guest-side validation/preparation exec
+    /// (`prepareGuestForCopy`) is allowed to run. The script only invokes
+    /// `sh`, `mkdir`, `ln`, and `test`, so it normally finishes in well under
+    /// a second; 30s leaves generous headroom for a slow/loaded VM while
+    /// still guaranteeing the PUT /containers/{id}/archive request can never
+    /// hang forever waiting on a wedged guest process (see issue #11: a
+    /// directory copy — which, unlike a single file dropped into an already
+    /// existing directory, requires the guest exec to actually create
+    /// directories — hung indefinitely because `process.wait()` here had no
+    /// timeout at all).
+    private static let guestPreparationTimeoutNs: UInt64 = 30_000_000_000
+
+    private enum GuestPreparationOutcome {
+        case exited(Int32)
+        case timedOut
+    }
+
+    /// Waits for `process` to exit, racing it against `timeoutNs`. On timeout
+    /// the process is sent SIGTERM (best effort) and a clean
+    /// `ClientArchiveError.operationFailed` is thrown instead of waiting
+    /// indefinitely. Mirrors the timeout-race pattern already used for
+    /// container healthchecks in `HealthCheckManager.execProbe`.
+    static func waitForGuestPreparation(process: ClientProcess, timeoutNs: UInt64) async throws -> Int32 {
+        let outcome: GuestPreparationOutcome = try await withThrowingTaskGroup(of: GuestPreparationOutcome.self) { group in
+            group.addTask { .exited(try await process.wait()) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNs)
+                return .timedOut
+            }
+            let result = try await group.next() ?? .timedOut
+            group.cancelAll()
+            return result
+        }
+
+        switch outcome {
+        case .exited(let code):
+            return code
+        case .timedOut:
+            try? await process.kill(SIGTERM)
+            throw ClientArchiveError.operationFailed(
+                message: "Timed out waiting for archive validation to complete inside the running container")
+        }
+    }
+
     /// Run Docker's PUT-archive validation inside the running guest and create
     /// the directory/symlink structure for the incoming archive: destination
     /// must exist (404) and be a directory (400), optional per-entry
     /// noOverwriteDirNonDir conflict checks, `mkdir` for missing directories
     /// (existing ones are left untouched), and `ln -sfn` for symlinks.
+    ///
+    /// The validation script only runs `sh`, `mkdir`, `ln`, and `test`, so it
+    /// normally completes in well under a second. `waitForGuestPreparation`
+    /// still bounds the wait (see its doc comment) so a wedged guest can never
+    /// hang the PUT /containers/{id}/archive request forever.
     private func prepareGuestForCopy(
         container: ContainerSnapshot,
         destinationPath: String,
@@ -487,7 +536,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let exitCode: Int32
         do {
-            exitCode = try await process.wait()
+            exitCode = try await Self.waitForGuestPreparation(process: process, timeoutNs: Self.guestPreparationTimeoutNs)
+        } catch let error as ClientArchiveError {
+            throw error
         } catch {
             // Concurrent close(2) + read(2) on the same fd is unsafe (NSException risk).
             // Rethrow immediately; stderrTask exits naturally when the process terminates

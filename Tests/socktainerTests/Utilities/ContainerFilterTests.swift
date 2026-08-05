@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationExtras
 import ContainerizationOCI
+import Logging
 import Testing
 
 @testable import socktainer
@@ -217,11 +218,56 @@ struct ContainerFilterTests {
 
     // MARK: - remaining filter keys (behavioural smoke tests)
 
-    @Test("name filter keeps containers matching by native id")
+    @Test("name filter with an exact value keeps only the matching container")
     func nameFilter() throws {
         let containers = [try makeSnapshot(id: "my-ctr"), try makeSnapshot(id: "other")]
         let result = ClientContainerService.applyFilters(containers, filters: ["name": ["my-ctr"]])
         #expect(result.map(\.id) == ["my-ctr"])
+    }
+
+    @Test("name filter matches by substring, not just exact equality")
+    func nameFilterSubstringMatch() throws {
+        let containers = [
+            try makeSnapshot(id: "keep-me"),
+            try makeSnapshot(id: "filter-me-out"),
+        ]
+        let result = ClientContainerService.applyFilters(containers, filters: ["name": ["keep"]])
+        #expect(result.map(\.id) == ["keep-me"])
+    }
+
+    @Test("name filter excludes containers whose name does not contain the value")
+    func nameFilterExcludesNonMatching() throws {
+        let containers = [
+            try makeSnapshot(id: "keep-me"),
+            try makeSnapshot(id: "filter-me-out"),
+        ]
+        let result = ClientContainerService.applyFilters(containers, filters: ["name": ["keep-me"]])
+        #expect(result.map(\.id) == ["keep-me"])
+        #expect(!result.map(\.id).contains("filter-me-out"))
+    }
+
+    @Test("multiple name values are ORed together")
+    func nameFilterMultipleValuesOr() throws {
+        let containers = [
+            try makeSnapshot(id: "keep-me"),
+            try makeSnapshot(id: "also-keep"),
+            try makeSnapshot(id: "drop-me"),
+        ]
+        let result = ClientContainerService.applyFilters(
+            containers, filters: ["name": ["keep-me", "also-keep"]])
+        #expect(Set(result.map(\.id)) == Set(["keep-me", "also-keep"]))
+    }
+
+    @Test("name filter ANDs with other filter keys")
+    func nameFilterAndsWithStatus() throws {
+        let containers = [
+            try makeSnapshot(id: "keep-me", status: .running),
+            try makeSnapshot(id: "keep-me-stopped", status: .stopped),
+            try makeSnapshot(id: "other", status: .running),
+        ]
+        let result = ClientContainerService.applyFilters(
+            containers, filters: ["name": ["keep"], "status": ["running"]])
+        #expect(result.map(\.id) == ["keep-me"])
     }
 
     @Test("is-task filter keeps containers with swarm task label")
@@ -254,6 +300,46 @@ struct ContainerFilterTests {
         let result = ClientContainerService.applyFilters(
             containers, filters: ["status": ["running"], "label": ["env=prod"]])
         #expect(result.map(\.id) == ["a"])
+    }
+}
+
+@Suite("DockerContainerFilterUtility.parseContainerFilters")
+struct ContainerFilterParsingTests {
+    private static let logger = Logger(label: "test")
+
+    @Test("dict-form encoding is parsed for every key, not just label")
+    func dictFormAllKeys() throws {
+        // What the Docker CLI actually sends for `--filter name=web --filter status=running`.
+        let json = #"{"name":{"web":true},"status":{"running":true}}"#
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: json, logger: Self.logger)
+        #expect(parsed["name"] == ["web"])
+        #expect(parsed["status"] == ["running"])
+    }
+
+    @Test("dict-form values set to false are dropped")
+    func dictFormFalseDropped() throws {
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":{"web":false}}"#, logger: Self.logger)
+        #expect(parsed["name"] == nil)
+    }
+
+    @Test("array and string forms still parse")
+    func arrayAndStringForms() throws {
+        let arrayForm = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":["web","db"]}"#, logger: Self.logger)
+        #expect(arrayForm["name"] == ["web", "db"])
+
+        let stringForm = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":"web"}"#, logger: Self.logger)
+        #expect(stringForm["name"] == ["web"])
+    }
+
+    @Test("multi-value dict form keeps every true key")
+    func dictFormMultipleValues() throws {
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":{"web":true,"db":true}}"#, logger: Self.logger)
+        #expect(parsed["name"]?.sorted() == ["db", "web"])
     }
 }
 
