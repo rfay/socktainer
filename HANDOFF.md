@@ -8,7 +8,11 @@ This file is expected to be deleted once the issues below are filed/fixed — it
 note, not documentation.
 
 Environment throughout: Apple `container` 1.2.0, socktainer 1.2.1 (Homebrew), macOS 26,
-Docker CLI 29.4.0, docker context `socktainer`.
+Docker CLI 29.4.0, docker context `socktainer`. **Note (2026-08-05):** use the signed
+installer's `container` CLI (`/usr/local/bin/container`, `installRoot: /usr/local/`), not
+the Homebrew formula — Homebrew installs `container` as a shadowed, unused dependency of
+something else on this machine (`brew info container` shows "Installed (as dependency)");
+running the wrong one is a separate, not-yet-filed issue in its own right (see TODOs).
 
 **None of the repro steps below need DDEV.** Each is a plain `docker`/`container`/`dig`
 sequence. The DDEV-specific reproduction is in the last section, for confirming a fix
@@ -30,6 +34,12 @@ request for *interactive* (`Tty:true`) execs. The exec bug below is about *non-i
 execs and is a connection-lifecycle issue, not a parsing one.
 
 ## Not yet filed — up for grabs
+
+**Status (2026-08-05):** items 1–8 below are all fixed locally, each on its own branch under
+`~/workspace/socktainer-worktrees/`, combined and verified together on `tmp/combined-verify-2`
+(built clean, full `ddev start`/`restart`/`stop` cycle passes end-to-end). None has an open
+PR — see `UPSTREAM_ROLLOUT.md` for the submission plan and two more bugs (9, 10 below) found
+after this file was originally written.
 
 ### 1. DNS: per-network resolver answers with the wrong network's address ("Bug B")
 
@@ -70,6 +80,9 @@ problem, not routing/firewall.
 Likely location: `Sources/socktainer/DNS/NetworkDNSManager.swift` /
 `SocktainerDNSServer.swift` — wherever the per-network resolver picks which of a
 multi-homed container's addresses to return.
+
+**Fixed on `fix/dns-wrong-network-address`:** stores one address per network per
+multi-homed container, returns whichever shares a subnet with the querying client.
 
 ### 2. Non-interactive exec: hijacked connection never closes after the process exits
 
@@ -124,6 +137,10 @@ related: if the hijacked connection's teardown depends on the same `stdout`/`std
 close signal described there, a dropped or ignored close callback on this specific path
 would produce exactly this symptom.
 
+**Fixed on `fix/exec-hijack-close`:** honors the upgrade request regardless of
+`attachStdin`, closes on output EOF. Supersedes the two commits that shipped as closed PR
+#347 — rewritten as one corrected commit.
+
 ### 3. `docker ps --filter name=<x>` is silently ignored
 
 ```bash
@@ -139,6 +156,10 @@ built on `docker ps --filter name=... | xargs docker rm -f` (a common idiom) wil
 containers it was never told to touch.
 
 Likely location: `Sources/socktainer/Routes/Containers/ContainerListRoute.swift`.
+
+**Fixed on `fix/filter-name-ignored`** (matching semantics) **+ `fix/dict-filter-parsing`**
+(parsing) — both were needed: the matcher was wrong, and separately the dict-form filter
+value was silently dropped before it ever reached the matcher for any key but `label`.
 
 ### 4. `PUT /containers/{id}/archive` 404s on a created-but-not-started container
 
@@ -158,6 +179,10 @@ works fine once the same container has been started at least once.
 Likely location: `Sources/socktainer/Routes/Containers/ContainerArchiveRoute.swift` /
 `Sources/socktainer/Clients/ClientArchiveService.swift`.
 
+**Fixed on `fix/archive-404-prestart`:** materializes `rootfs.ext4` on first archive access
+for a created-but-never-started container, using the same local bundle-creation APIs
+Apple's own runtime uses internally.
+
 ### 5. `docker cp` of a directory is unsupported, and hangs through the API instead of erroring
 
 ```bash
@@ -174,6 +199,9 @@ returning an error at all — worse than a clean rejection, since a caller has n
 give up and fall back to per-file copies.
 
 Likely location: `Sources/socktainer/Utilities/ArchiveUtility.swift`.
+
+**Fixed on `fix/cp-directory-hang`:** the guest-preparation exec used for directory copies
+now has a timeout bound, so a wedged/slow guest shell can't hang the request forever.
 
 ### 6. Healthcheck timing: long `start_period` never reports, and health regresses `healthy` → `starting`
 
@@ -201,6 +229,13 @@ status is not stable over time either.
 Likely location: `Sources/socktainer/Utilities/HealthCheckManager.swift` /
 `Sources/socktainer/Clients/ClientHealthCheckService.swift`.
 
+**Fixed on `fix/healthcheck-timing`,** two commits: probes during `start_period` instead of
+sleeping through it (status now correctly transitions once enough checks have run, however
+long `start_period` is), and probes as the container's own user instead of root (a second,
+independently-found bug — root-owned `/tmp/healthy` couldn't be removed by the container's
+own user on the next probe, breaking `ddev restart` specifically; no unit test possible,
+`execProbe` isn't reachable through the injectable test seam, verified live only).
+
 ### 7. Version/Engine both report the API version (`v1.51`) instead of a product version
 
 ```bash
@@ -218,6 +253,21 @@ far below any real minimum-engine-version check.
 
 Likely location: `Sources/socktainer/Routes/Server/VersionRoute.swift`.
 
+**Fixed on `fix/version-engine-version`:** `Version`/`Components[0].Version` now report
+socktainer's own build version instead of the API version.
+
+**Found and fixed 2026-08-05, same branch (`f4d022c`):** fixing `Version` wasn't enough —
+`ApiVersion`/`MinAPIVersion` themselves carry a literal `"v"` prefix (`"v1.51"`,
+`"v1.32"`), reusing a build-info label (`make version`) meant for human-readable output as
+the wire value. Real Docker Engine's `ApiVersion` field is always bare digits (`"1.51"`).
+Confirmed with a throwaway Go program against
+`github.com/moby/moby/client/pkg/versions`: `GreaterThanOrEqualTo("v1.51", "1.44")` is
+`false`, but `GreaterThanOrEqualTo("1.51", "1.44")` is `true` — the leading `"v"` alone,
+regardless of the actual number, is what makes any version-gating client (DDEV's own
+minimum-Docker-version check among them) reject a perfectly adequate API version. Fixed by
+stripping the `"v"` prefix at the `VersionRoute` call site only; the build-info getters
+that supply the labeled form elsewhere are untouched.
+
 ### 8. Container names containing underscores are skipped for DNS registration
 
 ```bash
@@ -234,6 +284,49 @@ underscores (which Docker itself allows in container names, if not always in *ho
 
 Likely location: `Sources/socktainer/DNS/NetworkDNSManager.swift` — whatever validates a
 name before registering it as a DNS record.
+
+**Status:** merged upstream independently (#344/#345) before this was ever filed; the local
+`fix/underscore-dns` branch/worktree was retired as redundant.
+
+### 9. `HostConfig.Privileged` is accepted but silently ignored
+
+```bash
+docker run -d --name privtest --privileged alpine sleep 300
+docker inspect privtest --format '{{.HostConfig.Privileged}}'
+```
+
+Expected: the container actually runs with all capabilities granted, matching what
+`HostConfig.Privileged: true` means on real Docker. Observed: the flag round-trips
+correctly on inspect, but the container's effective capability set is unaffected — no
+capabilities beyond the image's defaults are actually granted.
+
+Likely location: `Sources/socktainer/Routes/Containers/ContainerCreateRoute.swift`.
+
+**Fixed on `fix/privileged-cap-all`:** `effectiveCapAdd` now grants all capabilities when
+`HostConfig.Privileged` is set, matching Docker's own behavior.
+
+### 10. `HostConfig.PortBindings` is always `nil` on inspect
+
+```bash
+docker run -d --name porttest -p 8888:80 nginx:alpine
+docker inspect porttest --format '{{json .HostConfig.PortBindings}}'
+docker inspect porttest --format '{{json .NetworkSettings.Ports}}'
+```
+
+Expected: both fields report the same published-port mapping — Docker reports it in both
+places, `HostConfig.PortBindings` is what was requested, `NetworkSettings.Ports` is what is
+bound. Observed: `NetworkSettings.Ports` is correct; `HostConfig.PortBindings` is always
+`nil`. Severity note: this is the one most worth fixing regardless of any particular
+client — DDEV's own router-port-conflict check reads only `HostConfig.PortBindings` to
+learn which ports its own already-running router holds, so a `nil` here meant it always
+treated the router's own ports as some other process's conflict and a second project could
+never start, on any host, every time.
+
+Likely location: `Sources/socktainer/Routes/Containers/ContainerInspectRoute.swift` /
+`Sources/socktainer/Models/RESTConfig.swift`.
+
+**Fixed on `fix/port-bindings-inspect`:** derives both fields from the same
+`publishedPorts` data instead of hardcoding `HostConfig.PortBindings` to `nil`.
 
 ## Explicitly out of scope here — filed against the wrong project otherwise
 
@@ -280,18 +373,19 @@ EOF
 ddev start
 ```
 
-Before running `ddev start`, see `HANDOFF.md` in the `ddev` repo (same branch) for the
-**cold-start recipe** — a `keepalive` container, a host-side `dnsmasq` forwarding to
-socktainer's own DNS, and a hand-recreated buildkit node are all currently required for the
-environment to have working DNS/builds at all, independent of any of the bugs above. That
-file also has the full context these fixes came out of, including the exact byte-level
-traces for bugs A and B and the design discussion for the volume-sharing problem (which is
-Apple Container's, not socktainer's, per the "out of scope" section above).
+Before running `ddev start`, see `HANDOFF.md` in the `ddev` repo (same branch) for two
+recipes: **"Full teardown-and-rebuild recipe"** (rebuilding apple container, socktainer,
+and the docker context themselves from nothing — verified reproducible 2026-08-05) and,
+one layer up, the **cold-start recipe** — a `keepalive` container, a host-side `dnsmasq`
+forwarding to socktainer's own DNS, and a hand-recreated buildkit node, all still required
+for the environment to have working DNS/builds regardless of the bugs above. That file also
+has the full context these fixes came out of, including the exact byte-level traces for
+bugs A and B and the design discussion for the volume-sharing problem (which is Apple
+Container's, not socktainer's, per the "out of scope" section above).
 
-As of this writing, with items 1–2 above (DNS Bug B and the exec hang) unfixed, `ddev start`
-does not fully succeed: it reaches all three containers healthy and Traefik routing
-correctly, then either 502s on the last hop (DNS) or hangs indefinitely in
-`GetRouterConfigErrors()` (the exec hang — same `dockerutil.Exec()` codepath as the DNS Bug
-B repro's proxy scenario above, just reached via DDEV's own router-status check instead of
-a hand-rolled `curl`). Fixing #329 (already filed) plus items 1 and 2 in this file should be
-enough to get a plain PHP project fully working end-to-end.
+**Status as of 2026-08-05:** items 1–10 above are all fixed locally (combined and verified
+on `tmp/combined-verify-2`, per the note at the top of this file). With all of them plus
+#329 (DNS Bug A, already filed) applied, `ddev start`/`restart`/`describe`/`stop` succeed
+end-to-end against a plain PHP project — confirmed via a full teardown-and-rebuild-from-
+scratch run the same day. None of these fixes has an open PR yet; see
+`UPSTREAM_ROLLOUT.md` for the submission plan.
