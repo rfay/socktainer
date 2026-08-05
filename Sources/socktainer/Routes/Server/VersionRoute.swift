@@ -18,8 +18,8 @@ struct VersionRoute: RouteCollection {
                 //       the engine version (e.g. update nags), since 1.51 sorts far below any
                 //       real minimum-engine-version threshold. https://github.com/rfay/socktainer/issues/13
                 Version: getBuildVersion(),
-                ApiVersion: getDockerEngineApiMaxVersion(),
-                MinAPIVersion: getDockerEngineApiMinVersion(),
+                ApiVersion: Self.stripVPrefix(getDockerEngineApiMaxVersion()),
+                MinAPIVersion: Self.stripVPrefix(getDockerEngineApiMinVersion()),
                 GitCommit: getBuildGitCommit(),
                 Os: "macOS",
                 Arch: "arm64",
@@ -34,5 +34,16 @@ struct VersionRoute: RouteCollection {
             response.body = .init(string: "{\"message\": \"Failed to generate version information\"}\n")
             return response
         }
+    }
+
+    // getDockerEngineApiM{in,ax}Version() return a "v"-prefixed label (e.g. "v1.51") meant
+    // for human-readable build info (see BuildInfoApiVersionTests, the `make version` target).
+    // Real Docker's own ApiVersion/MinAPIVersion wire fields are always bare digits (e.g.
+    // "1.51"); clients that parse them as a dotted version number treat a leading "v" as
+    // unparseable and silently sort it below any real minimum. Confirmed against DDEV's own
+    // check: moby's versions.GreaterThanOrEqualTo("v1.51", "1.44") is false, but
+    // GreaterThanOrEqualTo("1.51", "1.44") is true.
+    private static func stripVPrefix(_ s: String) -> String {
+        s.hasPrefix("v") ? String(s.dropFirst()) : s
     }
 }
