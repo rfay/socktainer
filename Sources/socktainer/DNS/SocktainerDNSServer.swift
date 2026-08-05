@@ -174,7 +174,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         guard packet.count >= 12 else { return nil }
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
-        guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else { return nil }
+        guard let (qname, qtype, questionEnd) = parseQuestion(packet, offset: 12) else { return nil }
         let normalized = Self.normalize(qname)
         let isSingleLabel = !normalized.contains(".")
         if qtype == 1 {
@@ -183,24 +183,24 @@ final class SocktainerDNSServer: @unchecked Sendable {
             lock.unlock()
             if let ip {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
-                return buildAResponse(packet: packet, ip: ip)
+                return buildAResponse(packet: packet, questionEnd: questionEnd, ip: ip)
             }
             if isSingleLabel {
                 log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
-                return buildNxdomainResponse(packet: packet)
+                return buildNxdomainResponse(packet: packet, questionEnd: questionEnd)
             }
         } else if qtype == 28 {
-            if isSingleLabel { return buildNodataResponse(packet: packet) }
+            if isSingleLabel { return buildNodataResponse(packet: packet, questionEnd: questionEnd) }
             lock.lock()
             let known = entries[normalized] != nil
             lock.unlock()
-            if known { return buildNodataResponse(packet: packet) }
+            if known { return buildNodataResponse(packet: packet, questionEnd: questionEnd) }
         }
         // Any other single-label query type (HTTPS/SVCB/SRV/TXT/…) is answered NODATA
         // locally rather than forwarded: a single-label name has no public meaning, so
         // forwarding it upstream only invites an authoritative NXDOMAIN that poisons the
         // resolver's parallel A+AAAA lookups.
-        if isSingleLabel { return buildNodataResponse(packet: packet) }
+        if isSingleLabel { return buildNodataResponse(packet: packet, questionEnd: questionEnd) }
         return nil
     }
 
@@ -211,7 +211,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
 
-        guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else {
+        guard let (qname, qtype, questionEnd) = parseQuestion(packet, offset: 12) else {
             return forwardToUpstream(packet)
         }
 
@@ -227,20 +227,20 @@ final class SocktainerDNSServer: @unchecked Sendable {
             lock.unlock()
             if let ip {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
-                return buildAResponse(packet: packet, ip: ip)
+                return buildAResponse(packet: packet, questionEnd: questionEnd, ip: ip)
             }
             if isSingleLabel {
                 log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
-                return buildNxdomainResponse(packet: packet)
+                return buildNxdomainResponse(packet: packet, questionEnd: questionEnd)
             }
         } else if qtype == 28 {  // AAAA — container names are IPv4-only
             // For single-label names return NODATA unconditionally; forwarding to 1.1.1.1
             // would yield an authoritative NXDOMAIN that poisons concurrent A+AAAA resolvers.
-            if isSingleLabel { return buildNodataResponse(packet: packet) }
+            if isSingleLabel { return buildNodataResponse(packet: packet, questionEnd: questionEnd) }
             lock.lock()
             let known = entries[normalized] != nil
             lock.unlock()
-            if known { return buildNodataResponse(packet: packet) }
+            if known { return buildNodataResponse(packet: packet, questionEnd: questionEnd) }
         }
 
         return forwardToUpstream(packet)
@@ -264,18 +264,36 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return (labels.joined(separator: "."), qtype, pos)
     }
 
-    private func buildAResponse(packet: [UInt8], ip: [UInt8]) -> [UInt8] {
-        var response = packet
+    /// Header + question only, with every count but QDCOUNT zeroed and `flags` applied.
+    ///
+    /// Truncating at the end of the question is what makes the response well-formed:
+    /// echoing the whole query kept any EDNS0 OPT record the client sent in the
+    /// additional section while declaring ARCOUNT=0, so a strict parser (musl's
+    /// resolver, Go's) read those leftover OPT bytes as the start of the answer
+    /// section and reported "answer with no data" — which is what made every
+    /// container-name lookup fail for curl and traefik even though A lookups
+    /// through getent worked. Dropping EDNS0 from the reply is legal: a responder
+    /// that omits OPT is simply treated as not supporting it.
+    private func baseResponse(packet: [UInt8], questionEnd: Int, flags: UInt16) -> [UInt8] {
+        var response = Array(packet[0..<min(questionEnd, packet.count)])
         let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
-        let rflags: UInt16 = 0x8400 | rd  // QR=1, AA=1
+        let rflags = flags | rd
         response[2] = UInt8(rflags >> 8)
         response[3] = UInt8(rflags & 0xFF)
+        response[4] = 0
+        response[5] = 1  // QDCOUNT=1
         response[6] = 0
-        response[7] = 1  // ANCOUNT=1
+        response[7] = 0
         response[8] = 0
         response[9] = 0
         response[10] = 0
         response[11] = 0
+        return response
+    }
+
+    private func buildAResponse(packet: [UInt8], questionEnd: Int, ip: [UInt8]) -> [UInt8] {
+        var response = baseResponse(packet: packet, questionEnd: questionEnd, flags: 0x8400)  // QR=1, AA=1
+        response[7] = 1  // ANCOUNT=1
         response += [
             0xC0, 0x0C,  // NAME: pointer to offset 12
             0x00, 0x01,  // TYPE: A
@@ -287,35 +305,13 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return response
     }
 
-    private func buildNodataResponse(packet: [UInt8]) -> [UInt8] {
-        var response = packet
-        let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
-        let rflags: UInt16 = 0x8400 | rd
-        response[2] = UInt8(rflags >> 8)
-        response[3] = UInt8(rflags & 0xFF)
-        response[6] = 0
-        response[7] = 0
-        response[8] = 0
-        response[9] = 0
-        response[10] = 0
-        response[11] = 0
-        return response
+    private func buildNodataResponse(packet: [UInt8], questionEnd: Int) -> [UInt8] {
+        baseResponse(packet: packet, questionEnd: questionEnd, flags: 0x8400)
     }
 
     // Non-authoritative NXDOMAIN (no AA bit) so clients retry rather than cache permanently.
-    private func buildNxdomainResponse(packet: [UInt8]) -> [UInt8] {
-        var response = packet
-        let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
-        let rflags: UInt16 = 0x8003 | rd  // QR=1, Recursion Desired, RCODE=3
-        response[2] = UInt8(rflags >> 8)
-        response[3] = UInt8(rflags & 0xFF)
-        response[6] = 0
-        response[7] = 0
-        response[8] = 0
-        response[9] = 0
-        response[10] = 0
-        response[11] = 0
-        return response
+    private func buildNxdomainResponse(packet: [UInt8], questionEnd: Int) -> [UInt8] {
+        baseResponse(packet: packet, questionEnd: questionEnd, flags: 0x8003)  // QR=1, RD, RCODE=3
     }
 
     private func forwardToUpstream(_ packet: [UInt8]) -> [UInt8]? {

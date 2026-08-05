@@ -166,6 +166,90 @@ struct SocktainerDNSServerTests {
         server.register(hostname: "db", ip: "10.0.0.99")
         #expect(server.listEntries()["db"] == "10.0.0.99")
     }
+
+    // MARK: - Response well-formedness
+
+    @Test("End-to-end: a query carrying an EDNS0 OPT record gets a well-formed answer")
+    func endToEndEdns0QueryIsWellFormed() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "web", ip: "127.0.0.9/8")
+
+        // Query with an OPT record in the additional section, as musl's resolver and
+        // Go's send. The reply used to echo the query wholesale — OPT bytes included —
+        // while declaring ARCOUNT=0 and appending the A record after them, so a strict
+        // parser read the OPT bytes as the answer and reported "no data".
+        let reply = try #require(dnsQueryWithEdns0(name: "web", port: port), "server must answer the query")
+
+        #expect(reply.count >= 12)
+        #expect((Int(reply[4]) << 8) | Int(reply[5]) == 1, "QDCOUNT")
+        #expect((Int(reply[6]) << 8) | Int(reply[7]) == 1, "ANCOUNT")
+        #expect((Int(reply[10]) << 8) | Int(reply[11]) == 0, "no OPT may be claimed in the additional section")
+
+        // question for "web": 1 length byte + 3 label bytes + null + qtype/qclass
+        let questionLength = 1 + 3 + 1 + 4
+        #expect(reply.count == 12 + questionLength + 16, "no bytes may trail the single answer RR")
+
+        let answer = Array(reply[(12 + questionLength)...])
+        #expect(Array(answer[0..<2]) == [0xC0, 0x0C], "answer must start with the name pointer")
+        #expect(Array(answer[2..<4]) == [0x00, 0x01], "answer must be type A")
+        #expect(Array(answer[12..<16]) == [127, 0, 0, 9])
+    }
+}
+
+/// Sends one A query carrying the OPT pseudo-RR real resolvers send
+/// (name=root, type=41, udpsize=4096) and returns the raw reply bytes.
+private func dnsQueryWithEdns0(name: String, port: Int) -> [UInt8]? {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x12, 0x34, 0x01, 0x00]
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]  // QDCOUNT=1, ARCOUNT=1
+    packet += qname
+    packet += [0x00, 0x01, 0x00, 0x01]  // QTYPE=A, QCLASS=IN
+    packet += [
+        0x00,  // NAME: root
+        0x00, 0x29,  // TYPE: OPT (41)
+        0x10, 0x00,  // CLASS: requestor's UDP payload size (4096)
+        0x00, 0x00, 0x00, 0x00,  // extended RCODE + flags
+        0x00, 0x00,  // RDLENGTH: 0
+    ]
+
+    var dst = sockaddr_in()
+    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst.sin_family = sa_family_t(AF_INET)
+    dst.sin_port = in_port_t(port).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
+
+    for attempt in 0..<5 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { continue }
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let sent = packet.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &dst) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, ptr.baseAddress!, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent > 0 else { continue }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = recv(fd, &buf, buf.count, 0)
+        if n > 12 { return Array(buf[0..<n]) }
+    }
+    return nil
 }
 
 // MARK: - DNS query behaviour
