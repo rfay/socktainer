@@ -292,9 +292,11 @@ actor HealthCheckManager {
             processConfig.executable = cmd[0]
             processConfig.arguments = Array(cmd.dropFirst())
             processConfig.terminal = false
-            // Healthchecks run as root to avoid permission issues for probes
-            // that need to bind sockets, read pidfiles, etc.
-            processConfig.user = .id(uid: 0, gid: 0)
+            // Run as the container's own user, which is what initProcess already carries.
+            // Docker does the same, and probes are written for it: forcing root instead
+            // leaves root-owned state behind that the container's user cannot touch. DDEV's
+            // router healthcheck writes /tmp/healthy, then `rm -f /tmp/healthy` from a
+            // normal exec fails with EPERM and takes `ddev restart` down with it.
 
             let processId = "hc-\(UUID().uuidString.lowercased())"
             let process = try await containerClient.createProcess(
