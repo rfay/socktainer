@@ -270,6 +270,73 @@ struct ExecRoute: RouteCollection {
         }
     }
 
+    /// Outcome of racing an exec process's exit against a bounded fallback.
+    enum ExecWaitOutcome: Equatable {
+        case observed(Int32)
+        case unresolved
+    }
+
+    /// Single-assignment race result: whichever of `wait()`/timeout finishes
+    /// first reports here, and late/duplicate reports are silently dropped.
+    /// Kept separate from `waitForExitOutcome`'s own task group because a
+    /// non-cooperative `wait()` (one that doesn't observe cancellation) must
+    /// not keep the caller suspended — an actor-backed continuation can be
+    /// resumed by the winner without the loser's task ever being awaited.
+    private actor ExitOutcomeRace {
+        private var continuation: CheckedContinuation<ExecWaitOutcome, Never>?
+        private var outcome: ExecWaitOutcome?
+
+        func resolve(_ result: ExecWaitOutcome) {
+            guard outcome == nil else { return }
+            outcome = result
+            continuation?.resume(returning: result)
+            continuation = nil
+        }
+
+        func awaitOutcome() async -> ExecWaitOutcome {
+            if let outcome { return outcome }
+            return await withCheckedContinuation { continuation = $0 }
+        }
+    }
+
+    /// Races `wait` (typically `process.wait()`) against a fixed timeout so a
+    /// stalled Apple Container XPC exit acknowledgement can never hang the
+    /// caller forever. Every exec-start path (detached, chunked-stream, and
+    /// hijacked/TCP-upgrade) needs this: each has cleanup that must run once
+    /// the process is known to be done — recording the exit code, unblocking
+    /// a waiting stream/inspect, or closing the hijacked channel — and none of
+    /// that cleanup can be conditioned on an XPC call that sometimes never
+    /// resolves (issue #8: the hijacked path awaited `process.wait()` with no
+    /// timeout at all, so a stalled wait left the channel open forever).
+    ///
+    /// `wait()` runs as an unstructured `Task`, not a `TaskGroup` child: a
+    /// structured child that never observes cancellation would keep the
+    /// enclosing group (and this function) suspended until it finally
+    /// finishes. Racing via `ExitOutcomeRace` instead lets this function
+    /// return the moment the timeout fires; the stalled `wait()` task is
+    /// cancelled (a no-op if it ignores cancellation) and left to finish or
+    /// not on its own, unobserved.
+    static func waitForExitOutcome(
+        timeoutNanoseconds: UInt64,
+        wait: @escaping @Sendable () async throws -> Int32
+    ) async -> ExecWaitOutcome {
+        let race = ExitOutcomeRace()
+
+        let waitTask = Task<Void, Never> {
+            let outcome = (try? await wait()).map(ExecWaitOutcome.observed) ?? .unresolved
+            await race.resolve(outcome)
+        }
+        let timeoutTask = Task<Void, Never> {
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            await race.resolve(.unresolved)
+        }
+
+        let outcome = await race.awaitOutcome()
+        waitTask.cancel()
+        timeoutTask.cancel()
+        return outcome
+    }
+
     static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let execId = req.parameters.get("id") else {
@@ -378,22 +445,8 @@ struct ExecRoute: RouteCollection {
                     // the code and broadcast exec_die; if the wait stalls or errors without
                     // an observed exit, record a sentinel so GET /exec/{id}/json stops
                     // reporting Running: true, but broadcast no exec_die.
-                    enum ExecExit {
-                        case observed(Int32)
-                        case unresolved
-                    }
-                    let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                        g.addTask {
-                            if let code = try? await process.wait() { return .observed(code) }
-                            return .unresolved
-                        }
-                        g.addTask {
-                            try? await Task.sleep(nanoseconds: 60_000_000_000)
-                            return .unresolved
-                        }
-                        let result = await g.next() ?? .unresolved
-                        g.cancelAll()
-                        return result
+                    let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 60_000_000_000) {
+                        try await process.wait()
                     }
                     switch outcome {
                     case .observed(let code):
@@ -406,10 +459,16 @@ struct ExecRoute: RouteCollection {
                 return Response(status: .ok)
             }
 
-            // Check if client requested connection upgrade and attachStdin is true
+            // Honor an upgrade request whenever the client asks for one. moby
+            // hijacks on `Connection: Upgrade` + `Upgrade: tcp` regardless of
+            // whether stdin is attached, and clients that ask take over the
+            // socket and read until the *connection* closes — a chunked reply
+            // leaves them waiting forever on a keep-alive connection whose body
+            // has ended. Requiring attachStdin here is what hung DDEV's
+            // dockerutil.Exec (stdout/stderr only) on every container.
             let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
+            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
             guard shouldUpgrade else {
                 // Fallback to HTTP streaming mode
@@ -477,22 +536,8 @@ struct ExecRoute: RouteCollection {
                         // and broadcast exec_die; if it stalls/errors with no observed exit,
                         // record a sentinel so GET /exec/{id}/json leaves Running, but emit no
                         // exec_die (no death was observed).
-                        enum ExecExit {
-                            case observed(Int32)
-                            case unresolved
-                        }
-                        let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                            g.addTask {
-                                if let code = try? await process.wait() { return .observed(code) }
-                                return .unresolved
-                            }
-                            g.addTask {
-                                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                                return .unresolved
-                            }
-                            let result = await g.next() ?? .unresolved
-                            g.cancelAll()
-                            return result
+                        let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 10_000_000_000) {
+                            try await process.wait()
                         }
                         await ProcessRegistry.shared.remove(id: execId)
                         switch outcome {
@@ -648,10 +693,14 @@ struct ExecRoute: RouteCollection {
                 await ProcessRegistry.shared.set(id: execId, process: process)
                 if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
-                // Setup bidirectional communication for interactive sessions
-                await withTaskGroup(of: Void.self) { group in
+                // Setup bidirectional communication for interactive sessions.
+                // Tasks report whether they are an output task (true) so the
+                // channel can be closed on output EOF — see the drive loop below.
+                await withTaskGroup(of: Bool.self) { group in
+                    var outputTaskCount = 0
                     // stdout/stderr -> channel (container output to client)
                     if let stdoutHandle = pipes.stdout?.read {
+                        outputTaskCount += 1
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
@@ -715,10 +764,12 @@ struct ExecRoute: RouteCollection {
                                     }
                                 }
                             }
+                            return true  // output pipe drained
                         }
                     }
 
                     if let stderrHandle = pipes.stderr?.read {
+                        outputTaskCount += 1
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
@@ -775,13 +826,14 @@ struct ExecRoute: RouteCollection {
                                     }
                                 }
                             }
+                            return true  // output pipe drained
                         }
                     }
 
                     // Connection monitor to handle client disconnection
                     group.addTask {
                         // Monitor channel for closure - simplified approach
-                        while channel.isActive {
+                        while channel.isActive && !Task.isCancelled {
                             try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                         }
 
@@ -792,36 +844,67 @@ struct ExecRoute: RouteCollection {
                             container: container,
                             broadcaster: execBroadcaster
                         )
+                        return false
                     }
 
-                    // Process monitor with proper cleanup
-                    group.addTask {
-                        // moby emits `exec_die` only on an observed real exit. If wait()
-                        // throws, record a synthetic exit code so the exec leaves the
-                        // Running state (GET /exec/{id}/json), but broadcast no exec_die —
-                        // no clean exit was observed.
-                        let observedCode: Int32? = try? await process.wait()
-                        await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
-                        await ProcessRegistry.shared.remove(id: execId)
-                        if let observedCode {
-                            await broadcastExecEvent("exec_die", exitCode: observedCode)
+                    // Nothing attached to stdout/stderr means there is no EOF to wait
+                    // for, so the process exit is the only available close signal. The
+                    // bound here is a stall backstop, not the normal path — it is long
+                    // enough not to cut short a working exec.
+                    if outputTaskCount == 0 {
+                        outputTaskCount = 1
+                        group.addTask {
+                            _ = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 3_600_000_000_000) {
+                                try await process.wait()
+                            }
+                            return true
                         }
+                    }
 
-                        // Give a small delay for any final output to be processed
-                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                    // Close the channel once every output pipe has hit EOF — Apple
+                    // Container closes the container-side write ends when the exec
+                    // process exits, so EOF *is* the exit signal, and it arrives
+                    // whether or not XPC acknowledges the exit. Issue #8 was that the
+                    // close was instead gated on process.wait(), which Apple's XPC
+                    // sometimes never resolves; bounding that gate is not the answer
+                    // either, since it cuts off every exec that legitimately outlives
+                    // the bound — buildx's `buildctl dial-stdio` runs for a whole build.
+                    var drained = 0
+                    for await isOutput in group {
+                        guard isOutput else { continue }
+                        drained += 1
+                        guard drained >= outputTaskCount else { continue }
+
+                        // Record the exit code before closing: the client's follow-up
+                        // GET /exec/{id}/json reads it, and a close-first order makes
+                        // docker report 0 for a failing command. The bound starts here,
+                        // at observed EOF, not at process start — the process is already
+                        // known to be gone, so only a stalled XPC acknowledgement can
+                        // still be outstanding.
+                        let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 10_000_000_000) {
+                            try await process.wait()
+                        }
+                        await ProcessRegistry.shared.remove(id: execId)
+                        switch outcome {
+                        case .observed(let code):
+                            await ExecManager.shared.setExitCode(id: execId, code: code)
+                            await broadcastExecEvent("exec_die", exitCode: code)
+                        case .unresolved:
+                            // No death observed, so no exec_die — but record a sentinel
+                            // so GET /exec/{id}/json stops reporting Running forever.
+                            await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        }
 
                         // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
                         // it via writeQueue on channelInactive / inputClosed. Closing it here too
                         // would be a double-close that can kill a reused fd.
                         // stdout/stderr write ends are Apple-owned — also do not close them.
-
-                        // Close the channel gracefully
                         _ = channel.eventLoop.submit {
                             channel.close(promise: nil)
                         }
+                        group.cancelAll()
+                        break
                     }
-
-                    for await _ in group {}
                 }
 
                 // Keep the exec entry so the client's follow-up
