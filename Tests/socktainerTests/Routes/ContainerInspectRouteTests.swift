@@ -381,6 +381,85 @@ struct ContainerInspectRouteRestartPolicyTests {
     }
 }
 
+/// Regression tests: HostConfig.PortBindings was always nil on inspect, even though
+/// NetworkSettings.Ports correctly reported published ports from the same data.
+/// GetBoundHostPorts (used by DDEV's router-port-conflict check) reads only
+/// HostConfig.PortBindings, so a nil there made a caller unable to tell its own
+/// already-running container's ports from somebody else's — see PortBindingsTests.
+@Suite("ContainerInspectRoute — HostConfig.PortBindings")
+struct ContainerInspectRoutePortBindingsTests {
+
+    private func makeSnapshot(nativeId: String, ports: [PublishPort]) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh",
+            arguments: [],
+            environment: [],
+            workingDirectory: "/",
+            terminal: false,
+            user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:abc",
+                size: 0
+            )
+        )
+        var containerConfig = ContainerConfiguration(id: nativeId, image: img, process: proc)
+        containerConfig.publishedPorts = ports
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+    }
+
+    @Test("HostConfig.PortBindings reports published ports, matching NetworkSettings.Ports")
+    func portBindingsMatchNetworkSettingsPorts() async throws {
+        let nativeId = "inspect-port-bindings-ctr"
+        let port = try PublishPort(
+            hostAddress: try IPAddress("127.0.0.1"),
+            hostPort: 33000,
+            containerPort: 80,
+            proto: .tcp,
+            count: 1
+        )
+        let snapshot = makeSnapshot(nativeId: nativeId, ports: [port])
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                let hostConfigBinding = try #require(inspect.HostConfig.PortBindings?["80/tcp"]?.first)
+                #expect(hostConfigBinding.HostPort == "33000")
+                #expect(hostConfigBinding.HostIp == "127.0.0.1")
+                #expect(inspect.NetworkSettings.Ports?["80/tcp"]?.first?.HostPort == "33000")
+            }
+        }
+    }
+
+    @Test("HostConfig.PortBindings is nil when nothing is published")
+    func portBindingsNilWhenNothingPublished() async throws {
+        let nativeId = "inspect-no-ports-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId, ports: [])
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.PortBindings == nil)
+            }
+        }
+    }
+}
+
 // MARK: - Mock
 
 /// Mock that returns `snapshot` for any `getContainer` call.
