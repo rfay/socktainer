@@ -116,7 +116,12 @@ struct DockerContainerFilterUtility {
                     throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
                 }
                 for (key, value) in filters {
-                    if key == "label", let dict = value as? [String: Any] {
+                    // The Docker CLI encodes every filter as {"key":{"value":true}}
+                    // (filters.Args.MarshalJSON), not as an array — so restricting
+                    // the dict form to "label" silently dropped `docker ps --filter
+                    // name=…`, `status=…`, `id=…` and the rest, which is why the
+                    // filter appeared to have no effect at all.
+                    if let dict = value as? [String: Any] {
                         let keys = dict.compactMap { (k, v) in
                             (v as? Bool == true) ? k : nil
                         }

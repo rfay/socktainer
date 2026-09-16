@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationExtras
 import ContainerizationOCI
+import Logging
 import Testing
 
 @testable import socktainer
@@ -254,6 +255,46 @@ struct ContainerFilterTests {
         let result = ClientContainerService.applyFilters(
             containers, filters: ["status": ["running"], "label": ["env=prod"]])
         #expect(result.map(\.id) == ["a"])
+    }
+}
+
+@Suite("DockerContainerFilterUtility.parseContainerFilters")
+struct ContainerFilterParsingTests {
+    private static let logger = Logger(label: "test")
+
+    @Test("dict-form encoding is parsed for every key, not just label")
+    func dictFormAllKeys() throws {
+        // What the Docker CLI actually sends for `--filter name=web --filter status=running`.
+        let json = #"{"name":{"web":true},"status":{"running":true}}"#
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: json, logger: Self.logger)
+        #expect(parsed["name"] == ["web"])
+        #expect(parsed["status"] == ["running"])
+    }
+
+    @Test("dict-form values set to false are dropped")
+    func dictFormFalseDropped() throws {
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":{"web":false}}"#, logger: Self.logger)
+        #expect(parsed["name"] == nil)
+    }
+
+    @Test("array and string forms still parse")
+    func arrayAndStringForms() throws {
+        let arrayForm = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":["web","db"]}"#, logger: Self.logger)
+        #expect(arrayForm["name"] == ["web", "db"])
+
+        let stringForm = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":"web"}"#, logger: Self.logger)
+        #expect(stringForm["name"] == ["web"])
+    }
+
+    @Test("multi-value dict form keeps every true key")
+    func dictFormMultipleValues() throws {
+        let parsed = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"name":{"web":true,"db":true}}"#, logger: Self.logger)
+        #expect(parsed["name"]?.sorted() == ["db", "web"])
     }
 }
 
