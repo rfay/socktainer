@@ -216,6 +216,58 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
     return nil
 }
 
+/// Like `dnsRcode`, but returns the resolved IPv4 address from the A record answer
+/// rather than the RCODE. `buildAResponse` always appends a fixed 16-byte RR (name
+/// pointer + type + class + TTL + rdlength + 4-byte rdata) after the echoed question,
+/// so the last 4 bytes of a successful response are the answer's address.
+private func dnsAResponseIP(name: String, port: Int) -> String? {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x12, 0x34, 0x01, 0x00]
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    packet += qname
+    packet += [0x00, 0x01, 0x00, 0x01]  // QTYPE=A, QCLASS=IN
+
+    var dst = sockaddr_in()
+    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst.sin_family = sa_family_t(AF_INET)
+    dst.sin_port = in_port_t(port).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
+
+    for attempt in 0..<5 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { continue }
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let sent = packet.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &dst) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, ptr.baseAddress!, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent > 0 else { continue }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = recv(fd, &buf, buf.count, 0)
+        guard n >= 16 else { continue }
+        let rcode = buf[3] & 0x0F
+        let ancount = (Int(buf[6]) << 8) | Int(buf[7])
+        guard rcode == 0, ancount == 1 else { return nil }
+        let ip = buf[(n - 4)..<n]
+        return "\(ip[ip.startIndex]).\(ip[ip.startIndex + 1]).\(ip[ip.startIndex + 2]).\(ip[ip.startIndex + 3])"
+    }
+    return nil
+}
+
 @Suite("SocktainerDNSServer — query behaviour")
 struct SocktainerDNSQueryTests {
 
@@ -267,6 +319,101 @@ struct SocktainerDNSQueryTests {
         server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = dnsRcode(type: 28, name: "unknown-svc", port: port)
         #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+    }
+}
+
+// MARK: - Multi-homed hostname resolution (issue #7)
+//
+// A container attached to two networks gets one DNS registration per network
+// (see ContainerStartRoute.dnsAttachmentCIDRs). Every network's DNS forwarder sidecar
+// relays queries to this same SocktainerDNSServer instance, so the server must pick
+// the registered address that matches the *querying* network, not just return
+// whichever address happened to be registered first/last.
+
+@Suite("SocktainerDNSServer — multi-homed hostname resolution")
+struct SocktainerDNSMultiHomedTests {
+
+    // MARK: lookupAddress (direct — exercises the selection logic without needing to
+    // spoof a UDP packet's source address, which isn't possible from a test process).
+
+    @Test("Returns the peer's address on the network the query arrived from")
+    func lookupAddressPrefersQueryingClientsSubnet() {
+        let server = SocktainerDNSServer()
+        // "web" is attached to netA (192.168.10.0/24) and netB (192.168.20.0/24).
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+
+        // A query relayed by netB's DNS forwarder sidecar arrives with a source address
+        // on netB's subnet — the resolver must answer with web's netB address, which the
+        // querying container can actually reach, not netA's address.
+        let fromNetB: [UInt8] = [192, 168, 20, 42]
+        let answer = server.lookupAddress("web", clientIP: fromNetB)
+        #expect(answer == [192, 168, 20, 7], "must return web's address on netB, the querying network")
+
+        let fromNetA: [UInt8] = [192, 168, 10, 99]
+        let answerA = server.lookupAddress("web", clientIP: fromNetA)
+        #expect(answerA == [192, 168, 10, 5], "must return web's address on netA, the querying network")
+    }
+
+    @Test("Registering a second network for a hostname does not evict the first")
+    func registeringSecondNetworkKeepsFirst() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+
+        // Both addresses must still be resolvable — the old bug overwrote the single
+        // stored address on every register() call, regardless of subnet.
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 5])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7])
+    }
+
+    @Test("Re-registering the same network's address overwrites only that network's entry")
+    func reregisteringSameSubnetOverwritesInPlace() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+        // web's netA address changed (e.g. restart) — re-register under the same subnet.
+        server.register(hostname: "web", ip: "192.168.10.55/24")
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 55])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7], "netB's entry must be untouched")
+    }
+
+    @Test("Falls back to the first-registered address when the client's subnet matches none")
+    func fallsBackToFirstRegisteredAddressWhenNoSubnetMatches() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+
+        let unrelatedClient: [UInt8] = [10, 0, 0, 1]
+        #expect(server.lookupAddress("web", clientIP: unrelatedClient) == [192, 168, 10, 5])
+    }
+
+    // MARK: End-to-end over the real UDP server loop.
+    //
+    // The test client always sends from 127.0.0.1, so subnets are chosen so the
+    // loopback address unambiguously falls in exactly one of them — proving the fix
+    // all the way through recvfrom → handleLocalQuery → lookupAddress → buildAResponse,
+    // not just the pure selection helper.
+
+    @Test("End-to-end: query answered from the loopback-network entry, not the other network's")
+    func endToEndAnswersFromMatchingSubnet() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        // Loopback "network" registered first, containing the test client's real
+        // source address (127.0.0.1).
+        server.register(hostname: "web", ip: "127.0.0.9/8")
+        // "other" network registered second — pre-fix behaviour kept only the most
+        // recently registered address regardless of subnet, so without the fix this
+        // call would silently evict the loopback entry and the query below would get
+        // 10.99.0.7 instead.
+        server.register(hostname: "web", ip: "10.99.0.7/24")
+
+        let resolved = try #require(dnsAResponseIP(name: "web", port: port), "server must answer the query")
+        #expect(resolved == "127.0.0.9", "must answer with the address on the querying client's own subnet")
     }
 }
 
@@ -532,6 +679,46 @@ struct DNSAttachmentIPTests {
     @Test("Nil snapshot returns nil")
     func nilSnapshotReturnsNil() {
         #expect(ContainerStartRoute.dnsAttachmentIP(in: nil) == nil)
+    }
+}
+
+// MARK: - ContainerStartRoute.dnsAttachmentCIDRs (issue #7: register every qualifying
+// network attachment, not just the first, so multi-homed containers resolve correctly
+// on every network they're on)
+
+@Suite("ContainerStartRoute.dnsAttachmentCIDRs")
+struct DNSAttachmentCIDRsTests {
+
+    @Test("A container on two named networks returns a CIDR for each")
+    func multiHomedContainerReturnsBothCIDRs() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "192.168.10.5"), (network: "netB", ip: "192.168.20.7")],
+            labels: [:]
+        )
+        let result = ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot)
+        #expect(result == ["192.168.10.5/24", "192.168.20.7/24"], "must carry a CIDR for every named-network attachment, not just the first")
+    }
+
+    @Test("Reserved attachments are excluded, named ones kept")
+    func reservedAttachmentsExcluded() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
+            labels: [:]
+        )
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot) == ["192.168.65.20/24"])
+    }
+
+    @Test("Only reserved networks returns an empty list")
+    func onlyReservedNetworksReturnsEmpty() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot).isEmpty)
+    }
+
+    @Test("Nil snapshot returns an empty list")
+    func nilSnapshotReturnsEmpty() {
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: nil).isEmpty)
     }
 }
 
