@@ -143,9 +143,13 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
-        if startPeriodNs > 0 {
-            try? await Task.sleep(nanoseconds: startPeriodNs)
-        }
+        // start_period suppresses *failures*, not probes: Docker probes from the
+        // start and a success during the period marks the container healthy
+        // immediately. Sleeping the period out instead delays the first probe past
+        // it, which breaks any client whose readiness budget is the same value it
+        // passed as start_period — DDEV sets both from default_container_timeout,
+        // so health always landed a moment after DDEV had given up waiting.
+        let startPeriodEnd = Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000)
 
         var failingStreak = 0
 
@@ -157,6 +161,24 @@ actor HealthCheckManager {
             let end = Date()
 
             guard !Task.isCancelled else { return }
+
+            // A failure inside start_period is not yet a failure: leave the streak
+            // alone and stay "starting" so retries aren't consumed by a container
+            // that is simply still booting.
+            if exitCode != 0 && end < startPeriodEnd {
+                updateStatus(
+                    id: containerId,
+                    health: ContainerHealth(Status: "starting", FailingStreak: failingStreak, Log: []),
+                    logEntry: HealthLogEntry(
+                        Start: Self.formatISO8601(start),
+                        End: Self.formatISO8601(end),
+                        ExitCode: exitCode,
+                        Output: ""
+                    )
+                )
+                try? await Task.sleep(nanoseconds: intervalNs)
+                continue
+            }
 
             let entry = HealthLogEntry(
                 Start: Self.formatISO8601(start),
@@ -170,7 +192,20 @@ actor HealthCheckManager {
                 updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
-                let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
+                // Once a container has reported healthy, a transient failure below the
+                // retries threshold must not regress it to "starting" — Docker only ever
+                // moves healthy -> unhealthy (after Retries consecutive failures) or stays
+                // healthy. Only containers that never had a successful check fall back to
+                // "starting" while below the threshold.
+                let wasHealthy = statuses[containerId]?.Status == "healthy"
+                let status: String
+                if failingStreak >= maxRetries {
+                    status = "unhealthy"
+                } else if wasHealthy {
+                    status = "healthy"
+                } else {
+                    status = "starting"
+                }
                 updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
@@ -182,7 +217,61 @@ actor HealthCheckManager {
     private func runCheck(containerId: String, config: HealthcheckConfig, timeoutNs: UInt64) async -> Int32 {
         // nil means NONE / disabled / empty — do not mark the container healthy
         guard let cmd = Self.parseTest(config.Test) else { return 1 }
-        return await probe(containerId, cmd, timeoutNs)
+        // Bound the probe call ourselves rather than trusting it to self-enforce
+        // `timeoutNs`. `execProbe` races `process.wait()` against a sleep, but that
+        // race only covers the wait — the container lookup, `createProcess`, and
+        // `start()` calls that happen *before* it are unbounded. Structured
+        // concurrency (`withTaskGroup`) can't rescue that either: cancellation is
+        // cooperative, so a `TaskGroup` still blocks its own return on a child task
+        // that never checks `Task.isCancelled`. `Self.firstToFinish` sidesteps this
+        // by racing via a continuation and abandoning (not awaiting) the loser, so
+        // a probe that stalls anywhere in its lifecycle can never freeze this loop
+        // — and therefore `.State.Health` — past `timeoutNs`. See #12: with a long
+        // start_period/timeout, a stalled first probe left Status/Log frozen at
+        // "starting"/empty forever.
+        let probe = self.probe
+        return await Self.firstToFinish(
+            { await probe(containerId, cmd, timeoutNs) },
+            orAfter: timeoutNs,
+            fallback: 1
+        )
+    }
+
+    /// Runs `operation`, returning its result — or `fallback` if it hasn't finished
+    /// within `timeoutNs`. Unlike a `TaskGroup`-based race, this never blocks past
+    /// `timeoutNs`: the loser is abandoned (left running unstructured in the
+    /// background) rather than awaited, because Swift's structured-concurrency
+    /// teardown would otherwise wait for it regardless of cancellation.
+    private static func firstToFinish<T: Sendable>(
+        _ operation: @escaping @Sendable () async -> T,
+        orAfter timeoutNs: UInt64,
+        fallback: @autoclosure @escaping @Sendable () -> T
+    ) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            let resumed = ResumeOnce()
+            Task {
+                let result = await operation()
+                if resumed.tryFire() { continuation.resume(returning: result) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+                if resumed.tryFire() { continuation.resume(returning: fallback()) }
+            }
+        }
+    }
+
+    /// Guards a `CheckedContinuation` against being resumed twice when two
+    /// unstructured tasks are racing to resume it.
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+        func tryFire() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !fired else { return false }
+            fired = true
+            return true
+        }
     }
 
     // MARK: - Default probe (real exec)
@@ -203,9 +292,11 @@ actor HealthCheckManager {
             processConfig.executable = cmd[0]
             processConfig.arguments = Array(cmd.dropFirst())
             processConfig.terminal = false
-            // Healthchecks run as root to avoid permission issues for probes
-            // that need to bind sockets, read pidfiles, etc.
-            processConfig.user = .id(uid: 0, gid: 0)
+            // Run as the container's own user, which is what initProcess already carries.
+            // Docker does the same, and probes are written for it: forcing root instead
+            // leaves root-owned state behind that the container's user cannot touch. DDEV's
+            // router healthcheck writes /tmp/healthy, then `rm -f /tmp/healthy` from a
+            // normal exec fails with EPERM and takes `ddev restart` down with it.
 
             let processId = "hc-\(UUID().uuidString.lowercased())"
             let process = try await containerClient.createProcess(
