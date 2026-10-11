@@ -148,17 +148,23 @@ extension ContainerInspectRoute {
                 )
             }
 
-            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy)
+            // Docker reports published ports in both HostConfig.PortBindings (what was
+            // requested) and NetworkSettings.Ports (what is bound). Clients read either
+            // one: DDEV reads only HostConfig.PortBindings to learn which host ports its
+            // router already holds, and a nil there made it treat the router's own ports
+            // as somebody else's conflict, so no second project could ever start.
+            let portBindings = Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
+                .mapValues { bindings in
+                    bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
+                }
+            let hostConfig = HostConfig(restartPolicy: restartPolicy, portBindings: portBindings.isEmpty ? nil : portBindings)
 
             // Enhanced network settings with proper port mapping
             let networkEndpoints = Self.networkEndpoints(for: container)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
-                Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
-                    .mapValues { bindings in
-                        bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
-                    },
+                Ports: portBindings,
                 SandboxKey: nil,
                 Networks: networkEndpoints,
                 EndpointsConfig: networkEndpoints
