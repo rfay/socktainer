@@ -194,7 +194,14 @@ actor HealthCheckManager {
     private func runCheck(containerId: String, config: HealthcheckConfig, timeoutNs: UInt64) async -> Int32 {
         // nil means NONE / disabled / empty — do not mark the container healthy
         guard let cmd = Self.parseTest(config.Test) else { return 1 }
-        return await probe(containerId, cmd, timeoutNs)
+        // The probe's own timeout covers only process.wait(); the lookup, createProcess
+        // and start() before it are XPC calls that can hang without honoring
+        // cancellation, and a hung probe would freeze this loop and .State.Health for good.
+        let probe = self.probe
+        let exitCode = await StartupHousekeeping.runBoundedResult(timeout: .nanoseconds(timeoutNs)) {
+            await probe(containerId, cmd, timeoutNs)
+        }
+        return exitCode ?? 1
     }
 
     // MARK: - Default probe (real exec)

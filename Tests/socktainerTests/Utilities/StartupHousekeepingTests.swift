@@ -43,4 +43,15 @@ struct StartupHousekeepingTests {
         }
         #expect(finished == true)
     }
+
+    @Test("result variant yields the work's value in time and nil when abandoned")
+    func resultVariant() async {
+        let value = await StartupHousekeeping.runBoundedResult(timeout: .seconds(5)) { 42 }
+        #expect(value == 42)
+        let abandoned = await StartupHousekeeping.runBoundedResult(timeout: .milliseconds(20)) { () async -> Int in
+            try? await Task.sleep(for: .seconds(600))
+            return 42
+        }
+        #expect(abandoned == nil)
+    }
 }
