@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import Logging
 import Vapor
@@ -194,7 +195,14 @@ actor HealthCheckManager {
     private func runCheck(containerId: String, config: HealthcheckConfig, timeoutNs: UInt64) async -> Int32 {
         // nil means NONE / disabled / empty — do not mark the container healthy
         guard let cmd = Self.parseTest(config.Test) else { return 1 }
-        return await probe(containerId, cmd, timeoutNs)
+        // The probe's own timeout covers only process.wait(); the lookup, createProcess
+        // and start() before it are XPC calls that can hang without honoring
+        // cancellation, and a hung probe would freeze this loop and .State.Health for good.
+        let probe = self.probe
+        let exitCode = await StartupHousekeeping.runBoundedResult(timeout: .nanoseconds(timeoutNs)) {
+            await probe(containerId, cmd, timeoutNs)
+        }
+        return exitCode ?? 1
     }
 
     // MARK: - Default probe (real exec)
@@ -204,6 +212,18 @@ actor HealthCheckManager {
         case timedOut
     }
 
+    /// Builds the probe's process from the container's init process. Like Docker,
+    /// the probe keeps the container's configured user (as `docker exec` without
+    /// `-u` does): a root probe leaves root-owned files, such as a marker in sticky
+    /// `/tmp`, that the container's own user can then no longer remove.
+    static func probeProcessConfiguration(base: ProcessConfiguration, cmd: [String]) -> ProcessConfiguration {
+        var processConfig = base
+        processConfig.executable = cmd[0]
+        processConfig.arguments = Array(cmd.dropFirst())
+        processConfig.terminal = false
+        return processConfig
+    }
+
     /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
     /// Returns the exit code, or 1 on any failure.
     static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
@@ -211,14 +231,7 @@ actor HealthCheckManager {
             let containerClient = ContainerClient()
             guard let container = try? await containerClient.get(id: containerId) else { return 1 }
 
-            var processConfig = container.configuration.initProcess
-            processConfig.executable = cmd[0]
-            processConfig.arguments = Array(cmd.dropFirst())
-            processConfig.terminal = false
-            // Healthchecks run as root to avoid permission issues for probes
-            // that need to bind sockets, read pidfiles, etc.
-            processConfig.user = .id(uid: 0, gid: 0)
-
+            let processConfig = probeProcessConfiguration(base: container.configuration.initProcess, cmd: cmd)
             let processId = "hc-\(UUID().uuidString.lowercased())"
             let process = try await containerClient.createProcess(
                 containerId: containerId,

@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Testing
 
@@ -217,6 +218,43 @@ struct HealthCheckManagerTests {
         #expect((h?.FailingStreak ?? 0) >= 2)
         #expect(h?.Status == "healthy")
         await mgr.stop(containerId: "c1")
+    }
+
+    @Test("A probe that never returns is cut off at Timeout instead of freezing the loop")
+    func stalledProbeTimesOut() async throws {
+        let mgr = HealthCheckManager(
+            // Stands in for an exec whose container lookup or createProcess never returns.
+            probe: { _, _, _ in
+                try? await Task.sleep(nanoseconds: 3_600_000_000_000)
+                return 0
+            },
+            intervalFloorNs: 1_000_000
+        )
+        // Timeout is floored at minimumTimeoutNs (1s), so one retry keeps this inside waitForStatus.
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 10_000_000, Timeout: 50_000_000, Retries: 1, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("unhealthy", on: mgr, id: "c1")
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.FailingStreak ?? 0) >= 1)
+        #expect(h?.Log.allSatisfy { $0.ExitCode == 1 } == true)
+        await mgr.stop(containerId: "c1")
+    }
+
+    // MARK: - Probe process
+
+    @Test("Probe runs as the container's configured user, not root")
+    func probeKeepsContainerUser() {
+        let base = ProcessConfiguration(
+            executable: "/entrypoint.sh", arguments: ["serve"], environment: ["A=1"],
+            workingDirectory: "/app", terminal: true, user: .raw(userString: "501:20")
+        )
+        let probe = HealthCheckManager.probeProcessConfiguration(base: base, cmd: ["/bin/sh", "-c", "/healthcheck.sh"])
+        #expect(probe.user == .raw(userString: "501:20"))
+        #expect(probe.executable == "/bin/sh")
+        #expect(probe.arguments == ["-c", "/healthcheck.sh"])
+        #expect(probe.terminal == false)
+        #expect(probe.environment == ["A=1"])
+        #expect(probe.workingDirectory == "/app")
     }
 
     // MARK: - Health log entries
